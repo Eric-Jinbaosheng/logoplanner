@@ -45,29 +45,25 @@ def zeropower_via_newtonschulz5(g: torch.Tensor) -> torch.Tensor:
     return x
 
 
-def bidirectional_lact_swiglu(
+def _inner_fast_weight_update(
     w0: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     lr0: torch.Tensor,
     lr1: torch.Tensor,
     lr2: torch.Tensor,
     use_muon: bool = True,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Adapted from the official LaCT minimal implementation:
-    https://github.com/a1600012888/LaCT/blob/main/minimal_implementations/bidirectional_lact_layer.py
+    One inner-loop fast-weight update step.
     """
     w0_norm = w0.norm(dim=2, keepdim=True)
     w1_norm = w1.norm(dim=2, keepdim=True)
     w2_norm = w2.norm(dim=2, keepdim=True)
 
-    q_t = q.transpose(1, 2)
     v_t = v.transpose(1, 2)
-
     gate_before_act = torch.bmm(w0, k.transpose(1, 2))
     hidden_before_mul = torch.bmm(w2, k.transpose(1, 2))
     hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
@@ -90,9 +86,35 @@ def bidirectional_lact_swiglu(
     w1 = w1 + dw1
     w2 = w2 + dw2
 
+    # Keep fast-weight norms stable across inner updates.
     w0 = w0 / (w0.norm(dim=2, keepdim=True) + 1e-5) * w0_norm
     w1 = w1 / (w1.norm(dim=2, keepdim=True) + 1e-5) * w1_norm
     w2 = w2 / (w2.norm(dim=2, keepdim=True) + 1e-5) * w2_norm
+    return w0, w1, w2
+
+
+def bidirectional_lact_swiglu(
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lr0: torch.Tensor,
+    lr1: torch.Tensor,
+    lr2: torch.Tensor,
+    use_muon: bool = True,
+    inner_steps: int = 1,
+) -> torch.Tensor:
+    """
+    Adapted from the official LaCT minimal implementation:
+    https://github.com/a1600012888/LaCT/blob/main/minimal_implementations/bidirectional_lact_layer.py
+    """
+    q_t = q.transpose(1, 2)
+
+    # Explicit inner-loop fast-weight updates.
+    for _ in range(max(1, int(inner_steps))):
+        w0, w1, w2 = _inner_fast_weight_update(w0, w1, w2, k, v, lr0, lr1, lr2, use_muon)
 
     h = torch.bmm(w2, q_t)
     gate = F.silu(torch.bmm(w0, q_t), inplace=False)
@@ -122,6 +144,7 @@ class OfficialBidirectionalLaCTSwiGLU(nn.Module):
         use_muon: bool = True,
         base_lr: float = 1e-2,
         rope=None,
+        inner_steps: int = 1,
     ):
         super().__init__()
         self.dim = dim
@@ -132,6 +155,7 @@ class OfficialBidirectionalLaCTSwiGLU(nn.Module):
         self.qk_l2_norm = qk_l2_norm
         self.use_muon = use_muon
         self.rope = rope
+        self.inner_steps = max(1, int(inner_steps))
 
         self.to_qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.o_proj = nn.Linear(dim, dim, bias=False)
@@ -178,10 +202,15 @@ class OfficialBidirectionalLaCTSwiGLU(nn.Module):
         w1 = self.w1.repeat(bsz, 1, 1)
         w2 = self.w2.repeat(bsz, 1, 1)
 
-        output = bidirectional_lact_swiglu(w0, w1, w2, q, k, v, lr0, lr1, lr2, self.use_muon)
+        output = bidirectional_lact_swiglu(
+            w0, w1, w2, q, k, v, lr0, lr1, lr2, self.use_muon, inner_steps=self.inner_steps
+        )
         output = self.o_norm(output)
         output = output.view(bsz, self.num_heads, seq_len, self.head_dim).permute(0, 2, 1, 3).reshape(bsz, seq_len, self.dim)
         return self.o_proj(output)
+
+    def set_inner_steps(self, inner_steps: int) -> None:
+        self.inner_steps = max(1, int(inner_steps))
 
 
 class LaCTBlock(nn.Module):
@@ -195,6 +224,7 @@ class LaCTBlock(nn.Module):
         rope=None,
         base_lr: float = 1e-2,
         use_muon: bool = True,
+        inner_steps: int = 1,
     ):
         super().__init__()
         head_dim = dim // num_heads
@@ -208,6 +238,7 @@ class LaCTBlock(nn.Module):
             use_muon=use_muon,
             base_lr=base_lr,
             rope=rope,
+            inner_steps=inner_steps,
         )
         self.norm2 = norm_layer(dim)
         self.mlp = Mlp(
@@ -242,6 +273,7 @@ class LaCTDecoder(nn.Module):
         use_checkpoint: bool = False,
         base_lr: float = 1e-2,
         use_muon: bool = True,
+        inner_steps: int = 1,
         **_: dict,
     ) -> None:
         super().__init__()
@@ -258,6 +290,7 @@ class LaCTDecoder(nn.Module):
                     rope=rope,
                     base_lr=base_lr,
                     use_muon=use_muon,
+                    inner_steps=inner_steps,
                 )
                 for _ in range(depth)
             ]
@@ -272,3 +305,8 @@ class LaCTDecoder(nn.Module):
             else:
                 hidden = blk(hidden, xpos=xpos)
         return self.linear_out(hidden)
+
+    def set_inner_steps(self, inner_steps: int) -> None:
+        for blk in self.blocks:
+            if hasattr(blk, "lact") and hasattr(blk.lact, "set_inner_steps"):
+                blk.lact.set_inner_steps(inner_steps)

@@ -34,6 +34,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--step-stride", type=int, default=1)
     parser.add_argument("--max-episodes-per-tar", type=int, default=0)
     parser.add_argument("--depth-scale", type=float, default=1000.0)
+    parser.add_argument("--target-camera-height", type=float, default=None)
+    parser.add_argument("--target-camera-pitch-deg", type=float, default=None)
+    parser.add_argument("--camera-height-tol", type=float, default=0.05)
+    parser.add_argument("--camera-pitch-tol-deg", type=float, default=3.0)
     parser.add_argument(
         "--episode-cache-dir",
         type=str,
@@ -52,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-local", type=float, default=0.0)
     parser.add_argument("--lambda-world", type=float, default=0.0)
     parser.add_argument("--lambda-value", type=float, default=0.0)
+    parser.add_argument("--lact-inner-steps", type=int, default=1, help="Inner-loop update steps for LaCT decoder blocks.")
     parser.add_argument("--seed", type=int, default=20260320)
     return parser.parse_args()
 
@@ -80,6 +85,12 @@ def build_model(args: argparse.Namespace) -> LoGoPlanner_Policy:
         device=args.device,
     ).to(args.device)
     return model
+
+
+def set_lact_inner_steps(model: LoGoPlanner_Policy, inner_steps: int) -> None:
+    for module in model.modules():
+        if hasattr(module, "set_inner_steps"):
+            module.set_inner_steps(inner_steps)
 
 
 def encode_condition(model: LoGoPlanner_Policy, batch: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
@@ -165,6 +176,10 @@ def main() -> None:
         step_stride=args.step_stride,
         max_episodes_per_tar=args.max_episodes_per_tar,
         episode_cache_dir=args.episode_cache_dir or None,
+        target_camera_height=args.target_camera_height,
+        target_camera_pitch_deg=args.target_camera_pitch_deg,
+        camera_height_tol=args.camera_height_tol,
+        camera_pitch_tol_deg=args.camera_pitch_tol_deg,
     )
     loader = DataLoader(
         dataset,
@@ -176,6 +191,7 @@ def main() -> None:
     )
 
     model = build_model(args)
+    set_lact_inner_steps(model, args.lact_inner_steps)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = GradScaler(enabled=args.device.startswith("cuda"))
 

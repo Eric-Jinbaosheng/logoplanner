@@ -37,6 +37,10 @@ def yaw_from_rotation(rotation: np.ndarray) -> float:
     return float(np.arctan2(rotation[1, 0], rotation[0, 0]))
 
 
+def pitch_from_rotation(rotation: np.ndarray) -> float:
+    return float(np.arctan2(-rotation[2, 0], np.sqrt(rotation[2, 1] ** 2 + rotation[2, 2] ** 2)))
+
+
 def pose_summary(extrinsic: np.ndarray) -> np.ndarray:
     rotation = extrinsic[:3, :3]
     translation = extrinsic[:3, 3]
@@ -158,6 +162,10 @@ class InternDataN1TarDataset(Dataset):
         step_stride: int = 1,
         max_episodes_per_tar: int = 0,
         episode_cache_dir: str | Path | None = None,
+        target_camera_height: float | None = None,
+        target_camera_pitch_deg: float | None = None,
+        camera_height_tol: float = 0.05,
+        camera_pitch_tol_deg: float = 3.0,
     ):
         self.tar_files = discover_tar_files(inputs)
         self.memory_size = memory_size
@@ -167,6 +175,10 @@ class InternDataN1TarDataset(Dataset):
         self.step_stride = step_stride
         self.max_episodes_per_tar = max_episodes_per_tar
         self.episode_cache_dir = Path(episode_cache_dir).expanduser().resolve(strict=False) if episode_cache_dir else None
+        self.target_camera_height = target_camera_height
+        self.target_camera_pitch_deg = target_camera_pitch_deg
+        self.camera_height_tol = camera_height_tol
+        self.camera_pitch_tol_deg = camera_pitch_tol_deg
         if self.episode_cache_dir is not None:
             self.episode_cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -195,11 +207,24 @@ class InternDataN1TarDataset(Dataset):
                 for parquet_member in parquet_members:
                     episode_index = int(Path(parquet_member).stem.split("_")[-1])
                     seq_len = stats.get(episode_index)
-                    if seq_len is None:
+                    parquet_bytes = None
+                    df = None
+                    if seq_len is None or self._use_camera_pose_filter():
                         parquet_bytes = self._read_member_by_name(archive, parquet_member)
                         df = pd.read_parquet(io.BytesIO(parquet_bytes))
+                    if seq_len is None:
+                        assert df is not None
                         seq_len = len(df)
-                    for step_index in range(0, seq_len, self.step_stride):
+                    valid_step_indices = range(0, seq_len, self.step_stride)
+                    if self._use_camera_pose_filter():
+                        assert df is not None
+                        extrinsics = np.stack(df["observation.camera_extrinsic"].to_list(), axis=0).astype(np.float32).reshape(seq_len, 4, 4)
+                        valid_step_indices = [
+                            step_index
+                            for step_index in range(0, seq_len, self.step_stride)
+                            if self._camera_pose_matches_filter(extrinsics[step_index])
+                        ]
+                    for step_index in valid_step_indices:
                         self.index.append(
                             {
                                 "tar_path": str(tar_path),
@@ -208,6 +233,8 @@ class InternDataN1TarDataset(Dataset):
                                 "step_index": step_index,
                             }
                         )
+        if not self.index:
+            raise ValueError("No training samples remain after camera pose filtering.")
 
     def __len__(self) -> int:
         return len(self.index)
@@ -324,6 +351,21 @@ class InternDataN1TarDataset(Dataset):
             return None
         tar_stem = Path(tar_path).name.replace(".tar.gz", "")
         return self.episode_cache_dir / f"{tar_stem}_episode_{episode_index:06d}.npz"
+
+    def _use_camera_pose_filter(self) -> bool:
+        return self.target_camera_height is not None or self.target_camera_pitch_deg is not None
+
+    def _camera_pose_matches_filter(self, extrinsic: np.ndarray) -> bool:
+        translation = extrinsic[:3, 3]
+        rotation = extrinsic[:3, :3]
+        if self.target_camera_height is not None:
+            if abs(float(translation[2]) - self.target_camera_height) > self.camera_height_tol:
+                return False
+        if self.target_camera_pitch_deg is not None:
+            pitch_deg = float(np.degrees(pitch_from_rotation(rotation)))
+            if abs(pitch_deg - self.target_camera_pitch_deg) > self.camera_pitch_tol_deg:
+                return False
+        return True
 
     @staticmethod
     def _parse_episode_stats(stats_bytes: bytes) -> dict[int, int]:
